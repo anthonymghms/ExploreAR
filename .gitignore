@@ -1,0 +1,5 @@
+# Ignore weights folder
+/weights/
+
+# Ignore data folder
+/data/
