@@ -55,16 +55,6 @@ def segment_image(open_cv_image, xywh, label, maskPredictor, showImage = False):
         mask=masks
     )
     detections = detections[detections.area == np.max(detections.area)]
-    if showImage:
-        box_annotator = sv.BoxAnnotator(color=sv.Color.RED)
-        mask_annotator = sv.MaskAnnotator(color=sv.Color.RED, color_lookup=sv.ColorLookup.INDEX)
-        source_image = box_annotator.annotate(scene=image_rgb.copy(), detections=detections, skip_label=True)
-        segmented_image = mask_annotator.annotate(scene=image_rgb.copy(), detections=detections)
-        sv.plot_images_grid(
-            images=[source_image, segmented_image],
-            grid_size=(1, 2),
-            titles=['source image', 'segmented image']
-        )
     return masks
     
 def find_cleaned_hull(masks):
@@ -143,12 +133,11 @@ async def main(file: UploadFile = File(...)):
             start_time = time.time()
             buffer = await file.read()
             xywh, label, opencv_image = preprocess_image(buffer, model)
-            masks = segment_image(opencv_image,xywh, label,mask_predictor, False)
+            masks = segment_image(opencv_image,xywh, label,mask_predictor)
             cleaned_hull = find_cleaned_hull(masks[2])
             closest_points = get_closest_points(cleaned_hull)
             image = cv2.imencode('.png',fit_points_to_image(closest_points, opencv_image))
             content = image[1].tobytes()
-            print(content)
             end_time = time.time()
             print(f"Time taken: {end_time - start_time}")
             return Response(content=content, media_type="image/png")
