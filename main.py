@@ -5,18 +5,17 @@ import numpy as np
 import supervision as sv
 import MEP as MyMep
 import torch
-import matplotlib.pyplot as plt
 from io import BytesIO
 from PIL import Image
 from segment_anything import sam_model_registry, SamPredictor
 from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import Response
 from ultralytics import YOLO
 from contextlib import asynccontextmanager
 
-def set_globals(OutputPath):
-    global OUTPUT_PATH, HOME, CHECKPOINT_PATH, DETECTION_PATH, DEVICE, MODEL_TYPE
+def set_globals():
+    global HOME, CHECKPOINT_PATH, DETECTION_PATH, DEVICE, MODEL_TYPE
     HOME = os.getcwd()
-    OUTPUT_PATH = os.path.join(HOME,OutputPath)
     CHECKPOINT_PATH = os.path.join(HOME, "weights", "sam_vit_h_4b8939.pth")
     DETECTION_PATH = os.path.join(HOME, "weights", "best.pt")
     DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -68,17 +67,6 @@ def segment_image(open_cv_image, xywh, label, maskPredictor, showImage = False):
         )
     return masks
     
-def save_image(image):
-    plt.axis('off')
-    plt.gca().set_axis_off()
-    plt.subplots_adjust(top = 1, bottom = 0, right = 1, left = 0,
-                hspace = 0, wspace = 0)
-    plt.margins(0,0)
-    plt.gca().xaxis.set_major_locator(plt.NullLocator())
-    plt.gca().yaxis.set_major_locator(plt.NullLocator())
-    plt.imshow(image)
-    plt.savefig(OUTPUT_PATH)
-    
 def find_cleaned_hull(masks):
     opencv_mask_image = np.uint8(masks) * 255
     gray = np.float32(opencv_mask_image)
@@ -120,7 +108,7 @@ def get_closest_points(cleaned_hull):
     
     return closest_points
 
-def fit_points_to_image(closest_points, openCvImage, saveImage = False):
+def fit_points_to_image(closest_points, openCvImage):
     image = cv2.resize(openCvImage,(IM_WIDTH,IM_HEIGHT))
 
     for point in closest_points:
@@ -128,16 +116,13 @@ def fit_points_to_image(closest_points, openCvImage, saveImage = False):
         cv2.circle(image, (x1, y1), radius=5, color=(0, 0, 255), thickness=-1)
 
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    plt.imshow(image_rgb)
-    plt.show()
     
-    if saveImage:
-        save_image(image_rgb)
+    return image_rgb
         
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global mask_predictor, model
-    set_globals("\output.jpg")
+    set_globals()
     mask_predictor, model = load_models(MODEL_TYPE, CHECKPOINT_PATH, DETECTION_PATH, DEVICE)
     print("Models loaded")
     yield
@@ -145,7 +130,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
     
-@app.post('/run/')
+@app.post('/run/', 
+        responses={
+            200: {
+                "content": {"image/png": {}}
+            }
+        },
+        response_class=Response  
+        )
 async def main(file: UploadFile = File(...)):
     if file.filename:
             start_time = time.time()
@@ -154,9 +146,11 @@ async def main(file: UploadFile = File(...)):
             masks = segment_image(opencv_image,xywh, label,mask_predictor, False)
             cleaned_hull = find_cleaned_hull(masks[2])
             closest_points = get_closest_points(cleaned_hull)
-            fit_points_to_image(closest_points, opencv_image, True)
+            image = cv2.imencode('.png',fit_points_to_image(closest_points, opencv_image))
+            content = image[1].tobytes()
+            print(content)
             end_time = time.time()
             print(f"Time taken: {end_time - start_time}")
-            return {"Success": "Image processed successfully", "OutputPath": OUTPUT_PATH, "closePoints": closest_points.tolist()}
+            return Response(content=content, media_type="image/png")
     else:
         return {"Error": "File name is empty"}
