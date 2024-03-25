@@ -1,38 +1,41 @@
-
+import time
 import os
 import cv2
 import numpy as np
 import supervision as sv
 import MEP as MyMep
 import torch
-from segment_anything import sam_model_registry, SamPredictor
 import matplotlib.pyplot as plt
-from fastapi import FastAPI
+from io import BytesIO
+from PIL import Image
+from segment_anything import sam_model_registry, SamPredictor
+from fastapi import FastAPI, UploadFile, File
 from ultralytics import YOLO
+from contextlib import asynccontextmanager
 
-app = FastAPI()
-
-def set_globals(ImagePath, MaskPath, OutputPath):
-    global IMAGE_PATH, MASK_PATH,OUTPUT_PATH, HOME, CHECKPOINT_PATH, DETECTION_PATH, DEVICE, MODEL_TYPE
-    IMAGE_PATH = ImagePath
-    MASK_PATH = MaskPath
-    OUTPUT_PATH = OutputPath
+def set_globals(OutputPath):
+    global OUTPUT_PATH, HOME, CHECKPOINT_PATH, DETECTION_PATH, DEVICE, MODEL_TYPE
     HOME = os.getcwd()
+    OUTPUT_PATH = os.path.join(HOME,OutputPath)
     CHECKPOINT_PATH = os.path.join(HOME, "weights", "sam_vit_h_4b8939.pth")
     DETECTION_PATH = os.path.join(HOME, "weights", "best.pt")
     DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     MODEL_TYPE = "vit_h"
     
-def load_models(MODEL_TYPE, CHECKPOINT_PATH, DETECTION_PATH, DEVICE, IMAGE_PATH):
+def load_models(MODEL_TYPE, CHECKPOINT_PATH, DETECTION_PATH, DEVICE):
     sam = sam_model_registry[MODEL_TYPE](checkpoint=CHECKPOINT_PATH).to(device=DEVICE)
     mask_predictor = SamPredictor(sam)
     model = YOLO(DETECTION_PATH)
-    results = model.predict(IMAGE_PATH)
+    return mask_predictor, model
+    
+def preprocess_image(buffer, model):
+    open_cv_image = np.array(Image.open(BytesIO(buffer)))
+    results = model.predict(open_cv_image)
     xywh, label = results[0].boxes.xywh.tolist()[0], results[0].names.get(0)
-    return xywh, label, mask_predictor
+    return xywh, label, open_cv_image
 
-def segment_image(ImagePath, xywh, label, showImage = False):
-    image_bgr = cv2.imread(ImagePath)
+def segment_image(open_cv_image, xywh, label, maskPredictor, showImage = False):
+    global IM_WIDTH, IM_HEIGHT
     existing_box = { "x": (xywh[0] - (xywh[2]/2)), "y": (xywh[1] - (xywh[3]/2)), "width": xywh[2], "height": xywh[3], 'label': label}
     box = np.array([
         existing_box['x'],
@@ -40,10 +43,11 @@ def segment_image(ImagePath, xywh, label, showImage = False):
         existing_box['x'] + existing_box['width'],
         existing_box['y'] + existing_box['height']
     ])
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    mask_predictor.set_image(image_rgb)
+    image_rgb = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2RGB)
+    IM_WIDTH, IM_HEIGHT = image_rgb.shape[1], image_rgb.shape[0]
+    maskPredictor.set_image(image_rgb)
 
-    masks, _, _ = mask_predictor.predict(
+    masks, _, _ = maskPredictor.predict(
         box=box,
         multimask_output=True
     )
@@ -55,25 +59,14 @@ def segment_image(ImagePath, xywh, label, showImage = False):
     if showImage:
         box_annotator = sv.BoxAnnotator(color=sv.Color.RED)
         mask_annotator = sv.MaskAnnotator(color=sv.Color.RED, color_lookup=sv.ColorLookup.INDEX)
-        source_image = box_annotator.annotate(scene=image_bgr.copy(), detections=detections, skip_label=True)
-        segmented_image = mask_annotator.annotate(scene=image_bgr.copy(), detections=detections)
+        source_image = box_annotator.annotate(scene=image_rgb.copy(), detections=detections, skip_label=True)
+        segmented_image = mask_annotator.annotate(scene=image_rgb.copy(), detections=detections)
         sv.plot_images_grid(
             images=[source_image, segmented_image],
             grid_size=(1, 2),
             titles=['source image', 'segmented image']
         )
     return masks
-
-def save_mask_image(masks):
-    plt.axis('off')
-    plt.gca().set_axis_off()
-    plt.subplots_adjust(top = 1, bottom = 0, right = 1, left = 0,
-                hspace = 0, wspace = 0)
-    plt.margins(0,0)
-    plt.gca().xaxis.set_major_locator(plt.NullLocator())
-    plt.gca().yaxis.set_major_locator(plt.NullLocator())
-    plt.imshow(masks[2], interpolation='nearest', cmap='gray', aspect='auto')
-    plt.savefig(MASK_PATH)
     
 def save_image(image):
     plt.axis('off')
@@ -86,10 +79,9 @@ def save_image(image):
     plt.imshow(image)
     plt.savefig(OUTPUT_PATH)
     
-def find_cleaned_hull(MaskPath):
-    img = cv2.imread(MaskPath)
-    gray = cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
-    gray = np.float32(gray)
+def find_cleaned_hull(masks):
+    opencv_mask_image = np.uint8(masks) * 255
+    gray = np.float32(opencv_mask_image)
     dst = cv2.dilate(cv2.cornerHarris(gray,2,3,0.04),None)
     _, dst = cv2.threshold(dst,0.01*dst.max(),255,0)
     dst = np.uint8(dst)
@@ -128,8 +120,8 @@ def get_closest_points(cleaned_hull):
     
     return closest_points
 
-def fit_points_to_image(closest_points, IMAGE_PATH, saveImage = False):
-    image = cv2.resize(cv2.imread(IMAGE_PATH),(640,480))
+def fit_points_to_image(closest_points, openCvImage, saveImage = False):
+    image = cv2.resize(openCvImage,(IM_WIDTH,IM_HEIGHT))
 
     for point in closest_points:
         x1,y1 = point.astype(int)
@@ -141,12 +133,30 @@ def fit_points_to_image(closest_points, IMAGE_PATH, saveImage = False):
     
     if saveImage:
         save_image(image_rgb)
+        
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global mask_predictor, model
+    set_globals("\output.jpg")
+    mask_predictor, model = load_models(MODEL_TYPE, CHECKPOINT_PATH, DETECTION_PATH, DEVICE)
+    print("Models loaded")
+    yield
+    del mask_predictor, model
 
-if __name__ == "__main__":
-    set_globals("D:\ExploreAR\Baalbek.jpg", "D:\ExploreAR\data\Mask.png", "D:\ExploreAR\output.jpg")
-    xywh, label, mask_predictor = load_models(MODEL_TYPE, CHECKPOINT_PATH, DETECTION_PATH, DEVICE, IMAGE_PATH)
-    masks = segment_image(IMAGE_PATH,xywh, label, True)
-    save_mask_image(masks)
-    cleaned_hull = find_cleaned_hull(MASK_PATH)
-    closest_points = get_closest_points(cleaned_hull)
-    fit_points_to_image(closest_points, IMAGE_PATH, True)
+app = FastAPI(lifespan=lifespan)
+    
+@app.post('/run/')
+async def main(file: UploadFile = File(...)):
+    if file.filename:
+            start_time = time.time()
+            buffer = await file.read()
+            xywh, label, opencv_image = preprocess_image(buffer, model)
+            masks = segment_image(opencv_image,xywh, label,mask_predictor, False)
+            cleaned_hull = find_cleaned_hull(masks[2])
+            closest_points = get_closest_points(cleaned_hull)
+            fit_points_to_image(closest_points, opencv_image, True)
+            end_time = time.time()
+            print(f"Time taken: {end_time - start_time}")
+            return {"Success": "Image processed successfully", "OutputPath": OUTPUT_PATH, "closePoints": closest_points.tolist()}
+    else:
+        return {"Error": "File name is empty"}
