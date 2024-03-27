@@ -1,3 +1,4 @@
+import logging
 import time
 import os
 import cv2
@@ -9,7 +10,6 @@ from io import BytesIO
 from PIL import Image
 from segment_anything import sam_model_registry, SamPredictor
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import Response
 from ultralytics import YOLO
 from contextlib import asynccontextmanager
 
@@ -22,10 +22,18 @@ def set_globals():
     MODEL_TYPE = "vit_h"
     
 def load_models(MODEL_TYPE, CHECKPOINT_PATH, DETECTION_PATH, DEVICE):
-    sam = sam_model_registry[MODEL_TYPE](checkpoint=CHECKPOINT_PATH).to(device=DEVICE)
-    mask_predictor = SamPredictor(sam)
-    model = YOLO(DETECTION_PATH)
-    return mask_predictor, model
+    try:
+        logger.info(f"Loading SAM model from {CHECKPOINT_PATH}...")
+        sam = sam_model_registry[MODEL_TYPE](checkpoint=CHECKPOINT_PATH).to(device=DEVICE)
+        mask_predictor = SamPredictor(sam)
+        logger.info("SAM model loaded successfully.")
+        logger.info(f"Loading YOLO model from {DETECTION_PATH}...")
+        model = YOLO(DETECTION_PATH)
+        logger.info("YOLO model loaded successfully.")
+        return mask_predictor, model
+    except Exception as e:
+        logger.error(f"Error loading models: {e}")
+        raise
     
 def preprocess_image(buffer, model):
     open_cv_image = np.array(Image.open(BytesIO(buffer)))
@@ -55,10 +63,24 @@ def segment_image(open_cv_image, xywh, label, maskPredictor, showImage = False):
         mask=masks
     )
     detections = detections[detections.area == np.max(detections.area)]
+    if showImage:
+        box_annotator = sv.BoxAnnotator(color=sv.Color.RED)
+        mask_annotator = sv.MaskAnnotator(color=sv.Color.RED, color_lookup=sv.ColorLookup.INDEX)
+        source_image = box_annotator.annotate(scene=image_rgb.copy(), detections=detections, skip_label=True)
+        segmented_image = mask_annotator.annotate(scene=image_rgb.copy(), detections=detections)
+        sv.plot_images_grid(
+            images=[source_image, segmented_image],
+            grid_size=(1, 2),
+            titles=['source image', 'segmented image']
+        )
     return masks
     
 def find_cleaned_hull(masks):
-    opencv_mask_image = np.uint8(masks) * 255
+    mask_int = masks.astype(np.uint8) * 255
+    kernel = np.ones((11, 11), np.uint8)
+    mask_bool = cv2.morphologyEx(mask_int, cv2.MORPH_OPEN, kernel)
+    mask_clean_bool = (mask_bool > 0)
+    opencv_mask_image = np.uint8(mask_clean_bool) * 255
     gray = np.float32(opencv_mask_image)
     dst = cv2.dilate(cv2.cornerHarris(gray,2,3,0.04),None)
     _, dst = cv2.threshold(dst,0.01*dst.max(),255,0)
@@ -112,34 +134,45 @@ def fit_points_to_image(closest_points, openCvImage):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global mask_predictor, model
-    set_globals()
-    mask_predictor, model = load_models(MODEL_TYPE, CHECKPOINT_PATH, DETECTION_PATH, DEVICE)
-    print("Models loaded")
-    yield
-    del mask_predictor, model
+    try:
+        set_globals()
+        logger.info("Starting model loading process.")
+        mask_predictor, model = load_models(MODEL_TYPE, CHECKPOINT_PATH, DETECTION_PATH, DEVICE)
+        logger.info("All models loaded successfully. Application is starting...")
+        yield
+    except Exception as e:
+        logger.error(f"An error occurred during model loading: {e}")
+        raise e
+    finally:
+        logger.info("Application shutdown initiated. Cleaning up resources...")
+        if 'mask_predictor' in globals():
+            del mask_predictor
+        if 'model' in globals():
+            del model
+        logger.info("Resources cleaned up. Application has shut down.")
 
 app = FastAPI(lifespan=lifespan)
-    
-@app.post('/run/', 
-        responses={
-            200: {
-                "content": {"image/png": {}}
-            }
-        },
-        response_class=Response  
-        )
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@app.get('/test/')
+async def test():
+    return {"Status": "API is up and running"}
+
+@app.post('/run/')
 async def main(file: UploadFile = File(...)):
     if file.filename:
             start_time = time.time()
             buffer = await file.read()
             xywh, label, opencv_image = preprocess_image(buffer, model)
-            masks = segment_image(opencv_image,xywh, label,mask_predictor)
+            masks = segment_image(opencv_image,xywh, label,mask_predictor, False)
             cleaned_hull = find_cleaned_hull(masks[2])
             closest_points = get_closest_points(cleaned_hull)
-            image = cv2.imencode('.png',fit_points_to_image(closest_points, opencv_image))
-            content = image[1].tobytes()
             end_time = time.time()
-            print(f"Time taken: {end_time - start_time}")
-            return Response(content=content, media_type="image/png")
+            return {
+                "Status": "Image processed successfully",
+                "Time taken": end_time - start_time,
+                "Closest points": closest_points.tolist(),
+            }
     else:
         return {"Error": "File name is empty"}
